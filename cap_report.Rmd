@@ -1,0 +1,1209 @@
+---
+title: "Coursera - Predicting Possible Next Words"
+author: "Thomas Roscher"
+date: "`r Sys.Date()`"
+output:
+  prettydoc::html_pretty:
+    theme: cayman
+    highlight: github
+    toc: true
+    toc_depth: 2
+---
+knitr::opts_chunk$set(cache=TRUE)
+
+```{r packages, message=F, warning=F, results='hide'}
+library(plyr)       # function mapvalues()
+library(tidyverse)  # data frame manipulation
+library(stringr)    # string manipulation
+library(stringi)    # string manipulation
+library(tau)        # generate N-grams
+library(knitr)      # function kable()
+library(cowplot)    # plotting several gg
+library(data.table) # for fast binary serach with keys
+library(dtplyr)     # for combining the power of dplyr and data.table
+library(tictoc)
+```
+
+## Understanding the Problem 
+
+<p align="justify">
+Mobile devices are no longer a necessity, they've become a primal need. But lacking a full-size keyboard, text entry on touch screen devices in particular can be rather annoying. Natural Language Processing (NLP) which is a field that covers computer understanding and manipulation of human language offers possibilities to build models that tackle the problem described above.
+</p>
+
+<p align="justify">
+But how can we build models which predict the word that people may have in mind when writing? The basic idea is to learn from something called a corpus, which essentially is a collection of words or groups of words, within the language. Based on the information provided by corpus one can then build models that assign a probability to each possible next word. One of those language models (LM) is the so called N-gram model which is build around the idea that the probability of some future word depends only on a limited history of preceding words (Markov assumption).
+</p>
+
+<p align="justify">
+While this may sound complicated at first sight, the actual process is quiet straight forward. Once a "nice and clean" corpus is provided, one uses N-gram models to calculate the frequencies of words and group of words within the corpus. The resulting N-grams along with the calculated probabilities are then stored and form the basis for the word prediction algorithm. In essence, the actual prediction mechanism eventually just goes through the N-gram tables and based on the given input identifies adequate N-grams and suggests the ones with the highest probability. 
+</p>
+
+<p align="justify">
+Note, that this paper is not a summary but rather an in depth documentation of all steps and consideration which were required to train the final algorithm and apply it on a web application. Besides, whenever repetitive steps were required example code is shown only for the first element. Regarding model paramaters my aim is to build an algorithm thats runs in less then 0.5 seconds and requires a maximum of 250 Mbyte of backround data. 
+</p>
+
+<p align="justify">
+Disclaimer, I am by far no expert for LMs and basically this was my first that I occupied myself with the topic. 
+</p>
+## Getting and Sampling the Text Corpus
+
+<p align="justify">
+Coursera provided a fairly large dataset which consists of several hundred thousand news articles, blog entries and Twitter messages. So first things first, lets read in the data. I use the command readLines() because it is rather fast (reading the Twitter messages for example takes 8 seconds) and it matches the structure of the txt files. I set encoding to UTF-8 because otherwise some special characters are not displayed properly.
+</p>
+
+```{r read data, message=FALSE, warning=FALSE, cache=TRUE}
+# read data
+twitter   <- readLines("en_US.twitter.txt", encoding = "UTF-8")
+news      <- readLines("en_US.news.txt", encoding = "UTF-8")
+blog      <- readLines("en_US.blogs.txt", encoding = "UTF-8")
+profanity <- readLines("swearWords.txt", encoding = "UTF-8")
+
+# example to get a grasp of the data
+twitter[1]
+
+# mean characters across data sources
+print(c(mean(nchar(twitter)), mean(nchar(news)), mean(nchar(blog))))
+
+# number of blog, twitter, and news text blocks
+print(c(length(twitter), length(news), length(blog)))
+```
+
+<p align="justify">
+Having data from those 3 different sources is quiet nice because used words and word patterns may be rather different across them. However, because the data is fairly large as seen above and also because I need to consider the number of N-grams later on, sampling seems to be a valid approach. After sampling I merge the the data sources and further break everything down into sentences. Note, that I use more twitter entries because they contain on average much less characters, and thus sentences, compared to the other text sources.
+</p>
+
+```{r sampling, cache=TRUE}
+# sample data (final sample size used in the application later on)
+# set.seed(2017)
+# twitter.sample <- sample(twitter, 250000, replace = FALSE)
+# news.sample    <- sample(news, 50000, replace = FALSE)
+# blog.sample    <- sample(blog, 200000, replace = FALSE)
+# corpus         <- c(twitter.sample, news.sample, blog.sample)
+
+# sample data (used in this paper due to RAM)
+set.seed(2017)
+twitter.sample <- sample(twitter, 75000, replace = FALSE)
+news.sample    <- sample(news, 37500, replace = FALSE)
+blog.sample    <- sample(blog, 37500, replace = FALSE)
+corpus         <- c(twitter.sample, news.sample, blog.sample)
+
+# to deal with smiley and stuff like that
+corpus <- iconv(corpus, "UTF-8", "ASCII", "?")
+
+# split into single sentences (as good as possible)
+corpus <- unlist(strsplit(corpus , "[\\.\\!\\?\\:]+"))
+
+# number of sentences
+length(corpus)
+```
+
+```{r remove stuff, message=FALSE, warning=FALSE, include=FALSE}
+# drop old data to save RAM
+remove(twitter)
+remove(news)
+remove(blog)
+remove(twitter.sample)
+remove(news.sample)
+remove(blog.sample)
+```
+
+<p align="justify">
+Running the code above leaves me with a manageable amount of sentences for comparing some different approaches. I will increase the size of the corpus later on once the final algorithm is trained. 
+</p>
+
+## Normalizing the Text Corpus
+
+<p align="justify">
+Let's remind ourself that ideally, for N-Gram tokenization later on, one needs a nice and clean corpus which consists of nothing else but "valid" words. Hence, the first and arguably one of the most important steps before building any language model is normalizing the text corpus. I wrote the function norm.text() for that purpose which preforms a vast number of actions: 
+</p>
+
+* converts everything to lowercase
+* removes emails
+* removes urls
+* removes punctuation and symbols 
+* removes numbers 
+* removes useless white space 
+* removes twitter language
+* removes profanity
+* deals with apostrophes as special punctuation
+* removs some odd patterns which I encountered
+
+<p align="justify">
+Note that  even after running the code below, the corpus is far from perfect. For example, there probably are a lot of typos as well as what one may call "chat words" which strictly speaking are not real words but are nevertheless widely used on Internet (e.g. lol). Also there still are stop words as well as words with similar word stem. While what one may call base normalization is mandatory and done by norm.text(), removing stop words and merging words with the same word stem (as often done in text analysis) is arguably not adequat for word prediction. 
+</p>
+
+```{r function.normalization, message=FALSE, warning=FALSE, cache=TRUE}
+# normalize the text corpus
+norm.text <- function(string, swearwords){
+                # lower case
+                string <- tolower(string)
+                # e-mail
+                string <- str_replace_all(string, "\\S+@\\S+", "") 
+                # URLs
+                string <- str_replace_all(string, "http[[:alnum:]]*", "")
+                # hashtags
+                string <- str_replace_all(string, "#[[:alnum:]]*", "")
+                string <- str_replace_all(string, "# [[:alnum:]]*", "")
+                # @
+                string <- str_replace_all(string, "@[[:alnum:]]*", "")
+                string <- str_replace_all(string, "@ [[:alnum:]]*", "")
+                # twitter language
+                string <- str_replace_all(string, "RT", "")
+                string <- str_replace_all(string, "PM", "")
+                string <- str_replace_all(string, "rt", "")
+                string <- str_replace_all(string, "pm", "")
+                # apostrophes 
+                string <- str_replace_all(string, "'ll", " will")
+                string <- str_replace_all(string, "'d", " would")
+                string <- str_replace_all(string, "can't", "cannot")
+                string <- str_replace_all(string, "n't", " not")
+                string <- str_replace_all(string, "'re", " are")
+                string <- str_replace_all(string, "'m", " am")
+                string <- str_replace_all(string, "n'", " and")
+                #'s-genitive
+                string <- str_replace_all(string, "'s", " ")
+                string <- str_replace_all(string, "s'", " ")
+                # everything that is not number,letter, whitespace or '
+                string <- str_replace_all(string, "[^[:alnum:]]", " ")
+                # digits
+                string <- str_replace_all(string, "[:digit:]", "")
+                # more then one whitespace
+                string <- str_replace_all(string, "\\s+", " ")
+                # trim whitespace
+                string <- str_trim(string, side = c("both"))
+                # deal with "don t und dont"
+                string <- str_replace_all(string, "don t", "do not")
+                string <- str_replace_all(string, "dont", "do not")
+                # deal with "u s for usa"
+                string <- str_replace_all(string, "u s", "usa")
+                # profanity (for loop takes a while)
+                for (i in swearwords){ 
+                string <- str_replace_all(string, i, "")
+                }
+return(string)
+}
+# normalize text
+corpus.clean <- norm.text(corpus, profanity)
+```
+
+```{r remove stuff2, eval=FALSE, include=FALSE}
+remove(corpus)
+```
+
+## Splitting the Data
+
+<p align="justify">
+Next, I split the data into a training and a test set, so that I can check the accuracy of my algorithm later on.
+</p>
+
+```{r split data}
+set.seed(2007)
+idx <- sample.int(length(corpus.clean),size=length(corpus.clean)*0.1, replace=FALSE) 
+testing  <- corpus.clean[idx]
+training  <- corpus.clean[-idx]
+```
+
+```{r remove stuff3, include=FALSE}
+remove(corpus.clean)
+remove(idx)
+```
+
+## Tokanization
+
+<p align="justify">
+In lexical analysis, tokenization is the process of breaking a stream of text up into words, phrases, symbols, or other meaningful elements called tokens. The list of tokens becomes input for further processing. Eventually, I want to break the text down into words, to emit N-grams (N-grams are a contiguous sequence of n items from a given sequence of text or speech). R provides several packages that can be used for creating N-grams, including "tau", "ngram", "RWeka"  and "textcat". I chose Tau because it is rather fast.  
+</p>
+
+```{r generate n grams, cache = TRUE}
+# create N-grams
+unigram_tau  <- textcnt(training, n = 1L, method = "string", split = " ")
+bigram_tau   <- textcnt(training, n = 2L, method = "string", split = " ")
+trigram_tau  <- textcnt(training, n = 3L, method = "string", split = " ")
+fourgram_tau <- textcnt(training, n = 4L, method = "string", split = " ")
+fivegram_tau <- textcnt(training, n = 5L, method = "string", split = " ")
+
+# transform trie encodings to dataframe (illustrated only for unigram_tau)
+unigram.df <- data.frame(counts = unclass(unigram_tau), size = nchar(names(unigram_tau)))
+unigram.df$n.gram <- rownames(unigram.df)
+rownames(unigram.df) <- NULL
+```
+
+```{r create grams data frames, include=FALSE}
+bigram.df <- data.frame(counts = unclass(bigram_tau), size = nchar(names(bigram_tau)))
+bigram.df$n.gram <- rownames(bigram.df)
+
+trigram.df <-data.frame(counts = unclass(trigram_tau), size = nchar(names(trigram_tau)))
+trigram.df$n.gram <- rownames(trigram.df)
+
+fourgram.df <-data.frame(counts = unclass(fourgram_tau), size = nchar(names(fourgram_tau)))
+fourgram.df$n.gram <- rownames(fourgram.df)
+
+fivegram.df <-data.frame(counts = unclass(fivegram_tau), size = nchar(names(fivegram_tau)))
+fivegram.df$n.gram <- rownames(fivegram.df)
+
+rownames(bigram.df)  <- NULL
+rownames(trigram.df) <- NULL
+rownames(fourgram.df) <- NULL
+rownames(fivegram.df) <- NULL
+
+remove(unigram_tau)
+remove(bigram_tau)
+remove(trigram_tau)
+remove(fourgram_tau)
+remove(fivegram_tau)
+remove(training)
+```
+
+<p align="justify">
+Calculating the N-gram frequencies took quiet a while even when just using the rather small sample. However, since they must be created only once speeding up the process is less important. What is important though, is storing them efficiently. Why is that? Well, first of all storing them in R requires RAM which is a limited resource. Besides, one needs to consider that the amount of time the algorithm takes to make a prediction may be affected by the manner in which N-grams are stored. Thus, let's first take a look how large the generated N-grams are when stored in a data frame. </p>
+
+```{r size n grams}
+# used storage of the N-grams
+print(object.size(unigram.df) + object.size(bigram.df) + object.size(trigram.df) + object.size(fourgram.df) + object.size(fivegram.df))
+```
+
+<p align="justify">
+Unfortunately, it seems that the classical data frame is not really suitable since the N-grams of my sample already requires a lot of RAM. Thus, I may have to switch to some other storage type later on. Using SQLite or data.table might be an option. Yet, let's turn to some data exploration first to see if we can get some additional valuable insights. Maybe I can handle the size issue without using an external database. 
+</p>
+
+## Exploring the Data
+<p align="justify">
+Next, I gonna build some  figures to understand variation in the frequencies (I used log because data is highly skewed) of words and word pairs in the data. Note, that I restricted the plot samples containing 70000 of the respective N-grams. Code below is illustrative for the two plot types:
+</p>
+```{r plots}
+set.seed(2017)
+p1 <- ggplot(sample_n(unigram.df, 70000, replace = FALSE), 
+             aes(x = log(counts))) + 
+                geom_histogram(color = "steelblue", 
+                               fill = "white", 
+                               alpha=.7, 
+                               binwidth = 0.5) +
+                theme_gray() + 
+                xlab("") +
+                ylab("") +
+                ggtitle("Distribution of 1-grams")
+   
+set.seed(2017)
+p4 <- top_n(sample_n(unigram.df, 70000, replace = FALSE), n = 10, counts) %>%
+                ggplot(., aes(x = n.gram, y = counts)) +
+                geom_bar(stat='identity', 
+                         color = "steelblue", 
+                         fill = "white") +
+                theme_gray() +
+                coord_flip() +
+                xlab("") +
+                ylab("") +
+                ggtitle("Most common 1-grams")
+```
+
+```{r plot frequencies, include=FALSE}
+set.seed(2017)
+p2 <- ggplot(sample_n(bigram.df, 70000, replace = FALSE), aes(x = log(counts))) + 
+                geom_histogram(color = "steelblue", fill = "white", alpha=.7, binwidth = 0.5) +
+                theme_gray() +
+                xlab("") +
+                ylab("") +
+                ggtitle("Distribution of 2-grams")
+
+set.seed(2017)
+p3 <- ggplot(sample_n(trigram.df, 70000, replace = FALSE), aes(x = log(counts))) + 
+                geom_histogram(color = "steelblue", fill = "white", alpha=.7, binwidth = 0.5) +
+                theme_gray() +
+                xlab("") +
+                ylab("") +
+                ggtitle("Distribution of 3-grams")
+
+set.seed(2017)
+p5 <- top_n(sample_n(bigram.df, 70000, replace = FALSE), n=10, counts) %>%
+                ggplot(., aes(x = n.gram, y = counts)) +
+                geom_bar(stat='identity', color = "steelblue", fill = "white") +
+                theme_gray() +
+                coord_flip() +
+                xlab("") +
+                ylab("") +
+                ggtitle("Most common 2-grams")
+
+set.seed(2017)
+p6 <- top_n(sample_n(trigram.df, 70000, replace = FALSE), n=10, counts) %>%
+                ggplot(., aes(x = n.gram, y = counts)) +
+                geom_bar(stat='identity', color = "steelblue", fill = "white") +
+                theme_gray() +
+                coord_flip() +
+                xlab("") +
+                ylab("") +
+                ggtitle("Most common 3-grams")
+```
+
+```{r fig.align = 'center', echo = FALSE, fig.height = 2, fig.width = 7, message = FALSE, warning=FALSE}
+plot_grid(p1, p4, align='h', labels=c(''))
+plot_grid(p2, p5, align='h', labels=c(''))
+plot_grid(p3, p6, align='h', labels=c(''))
+```
+
+<p align="justify">
+Well, obviously there is a tremendous amount of N-grams that show only up a few times (often even just once). Many of them are useless things like "aaarrrgggghhh". This finding may be rather interesting since it suggests that deleting those cases to lower the number of the N-grams might be a valid approach to save some memory and run time. The variable size which counts the characters of each N gram, also supports that approach because there seem to be fare too many one and two letter words as well as words with and oddly large number of characters. Regarding the most used words and word pairs, the plots show that there frequency drops off quickly and that unsurprisingly stop words are most prevalent. 
+</p>
+
+<p align="justify">
+Next, let's investigate how many unique n-grams one needs in a frequency sorted dictionary to cover a certain amount of all n-gram instances in the corpus. 
+</p>
+
+```{r}
+# illustrative variable creation for unigrams
+unigram.df.p <- sample_n(unigram.df, 70000, replace = FALSE) %>%
+                arrange(desc(counts)) %>%
+                mutate(counts.cs.p = cumsum(counts)/sum(counts)) %>%
+                mutate(id = c(1:70000))
+
+x <- unigram.df.p %>%
+filter(counts.cs.p > 0.7499)  %>%
+head(n = 3L)
+kable(x)
+```
+
+```{r, echo = FALSE}
+bigram.df.p <- sample_n(bigram.df, 70000, replace = FALSE)  %>%
+                arrange(desc(counts)) %>%
+                mutate(counts.cs.p = cumsum(counts)/sum(counts)) %>%
+                mutate(id = c(1:70000))
+
+
+trigram.df.p <- sample_n(trigram.df, 70000, replace = FALSE) %>%
+                arrange(desc(counts)) %>%
+                mutate(counts.cs.p = cumsum(counts)/sum(counts)) %>%
+                mutate(id = c(1:70000))
+
+```
+
+<p align="justify">
+Above you see that in order to cover 75 percent of the 1-gram instances in the sample corpus not to many of the most occurring words are needed. Let's plot this stuff for all N-grams to get even more valuable information. Code below is illustrative for one of the three plots.
+</p>
+
+```{r}
+p7 <- ggplot(unigram.df.p, aes(x=id, y=counts.cs.p)) +
+                geom_line(color = "steelblue") +
+                theme_gray() + 
+                xlab("") +
+                ylab("") +
+                ggtitle("")
+```
+
+```{r, message=FALSE, warning=FALSE, include=FALSE}
+p8 <- ggplot(bigram.df.p, aes(x=id, y=counts.cs.p)) +
+                geom_line(color = "steelblue") +
+                theme_gray() +
+                xlab("") +
+                ylab("") +
+                ggtitle("")
+
+p9 <- ggplot(trigram.df.p, aes(x=id, y=counts.cs.p)) +
+                geom_line(color = "steelblue") +
+                theme_gray() +
+                xlab("") +
+                ylab("") +
+                ggtitle("")
+```
+
+```{r fig.align='center', echo=FALSE, fig.height=5, fig.width=4, message=FALSE, warning=FALSE}
+plot_grid(p7,p8,p9, labels = "", ncol = 1, align = 'v')
+```
+
+<p align="justify">
+Clearly, at least for the 2-grams there is a strongly exponential pattern which becomes less extreme as the number of N increases. Well, what does this imply for the algorithm? Clearly there is a point where adding rare N-grams does not seem to be efficient because gaining a bit more coverage requires a vast amount data.
+</p>
+
+## Building the Algorithm: Stupid Backoff - A First Approach using "dplyr"
+
+<p align="justify">
+Now that I have some workable data and got an idea about it's descriptive characteristics the next step is to create an algorithm which assigns probabilities to the various N-grams and returns the top predictions based on an input string. The basic idea is to start with a simple baseline model which then can be used to tweak parameters. What follows is an implementation of a "stupid back off model" which starts with 5-grams. Here, back off basically means that one goes back to a N-1 gram model to calculate probabilities whenever one encounters a word with the probabilities of zero. For each time I back off one level, the probabilities are multiplied with the back off factor alpha (0.4). The aim here is not to code the final product. Rather I want to get a functioning base model which is then used to test any further specifications regarding things as efficient coding, data storage, sampling size, or corpus setting. 
+</p>
+
+<p align="justify">
+In order to illustrate the algorithm let's walk through an example where we want to complete the sentence "I must know what are you going to".     
+</p>
+
+1. Take the last four words of the input sentence ("are you going to").
+2. Look for any 5-grams that with those last four words.
+3. If applicable store the last word of encountered 5-grams and and calculate their probability.
+4. Probability is calculated as follows: Number of times that 5-grams ended with that word divided by how often it's first four words show up in the 4-gram table. 
+5. For example "are you going to be" may show up x times in the 5-gram table and "are you going to" may be listed y times in the 4-gram table. Therefore, the probability is x/y.
+6. Store the 3 most probable words. 
+7. Step wise back off to the 2-gram level. For each level repeat the procedure with an adjusted probability (x*0.4) and store 3 most probable words
+8. Drop any words that are suggested again during the backing off process. 
+9. Print the three most probable words along with their probability.
+10. Lastly, if there are no matches just print the three most common words in the corpus. 
+
+<p align="justify">
+Before writing the function, I preform two actions to reduce the size of the N-gram tables. First, I delete now useless variables that were created during the analysis so far. Secondly, I drop any N-grams which show up only once which reduces the size of the N-gram tables by about 50 percent.
+</p>
+
+```{r}
+# based on the findings in the descriptive part, I drop any N-gram that shows up only once
+unigram.df.short  <- filter(unigram.df, counts > 1) %>%
+                     select(n.gram, counts)
+bigram.df.short   <- filter(bigram.df, counts > 1) %>%
+                     select(n.gram, counts)
+trigram.df.short  <- filter(trigram.df, counts > 1) %>%
+                     select(n.gram, counts)
+fourgram.df.short <- filter(fourgram.df, counts > 1) %>%
+                     select(n.gram, counts)
+fivegram.df.short <- filter(fivegram.df, counts > 1)%>%
+                     select(n.gram, counts)
+
+# used storage of the N-grams
+print(object.size(unigram.df.short) + object.size(bigram.df.short) + object.size(trigram.df.short) + object.size(fourgram.df.short) + object.size(fivegram.df.short))
+```
+
+```{r, include = FALSE}
+rm(unigram.df, bigram.df, trigram.df, fourgram.df, fivegram.df)
+```
+
+<p align="justify">
+Next, now that everything is prepared let's create the algorithm. Basically, I create 4 of them where one is for input sentences of at least 4 words length. The other three are for input sentences of length 3,2, and 1, respectively. Code is shown only for the first one because it remains basically the same except that the "starting point" is are different N-grams.
+</p>
+
+```{r, message = FALSE, warning = FALSE}
+# useful function to get n last word, borrowed from a fellow student
+getLastWords <- function(string, words) {
+    pattern <- paste("[a-z']+( [a-z']+){", words - 1, "}$", sep="")
+    return(substring(string, str_locate(string, pattern)[,1]))
+}
+############################
+######## ALGORITHM #########
+############################
+
+# pred.word4 is for cases where the input sentence is at least 4 words
+pred.word4 <- function(input.sentence){
+        
+# take the last four words from input sentence as input for 5-gram table
+isr5 <- getLastWords(input.sentence, 4)
+# take the last three word from input sentence as input for 4-gram table
+isr4 <- getLastWords(isr5, 3)
+# take the last two words from input sentence as input for 3-gram table
+isr3 <- getLastWords(isr4, 2)
+# take the last word from input sentence as input for 2-gram table
+isr2 <- getLastWords(isr3, 1)
+
+# start at the 5-gram table
+pred.five <- fivegram.df.short %>%
+    # In the 5-gram table filter any 5-grams that start with the last four
+    # words from input sentence and end with a whitespace
+    filter(grepl(paste0("^", isr5," "), n.gram)) %>%
+    # create variable that shows last word of the filtered 5-grams
+    mutate(predicted.word = getLastWords(n.gram, 1))  %>%
+    # calculate propability for the last word
+    mutate(propability = counts/fourgram.df.short$counts[fourgram.df.short$n.gram == isr5]) %>%
+    # arrange descending
+    arrange(desc(propability)) %>%
+    # only keep the predicted word and it's propability
+    select(predicted.word, propability) %>%
+    # only keep top 3 
+    top_n(3) 
+        
+# do exactly the same stuff for the 4-gram table plus backoff factor
+pred.four <- fourgram.df.short %>%  
+    filter(grepl(paste0("^", isr4," "), n.gram)) %>%
+    mutate(predicted.word = getLastWords(n.gram, 1))  %>% 
+    mutate(propability = (counts*0.4)/trigram.df.short$counts[trigram.df.short$n.gram == isr4]) %>%
+    arrange(desc(propability)) %>%
+    select(predicted.word, propability) %>%
+    top_n(3) 
+        
+# do exactly the same stuff for the 3-gram table plus backoff factor
+pred.tri <- trigram.df.short %>%  
+    filter(grepl(paste0("^", isr3," "), n.gram)) %>%
+    mutate(predicted.word = getLastWords(n.gram, 1))  %>% 
+    mutate(propability = (counts*0.4*0.4)/bigram.df.short$counts[bigram.df.short$n.gram == isr3]) %>%
+    arrange(desc(propability)) %>%
+    select(predicted.word, propability) %>%
+    top_n(3) 
+           
+# do exactly the same stuff for the 2-gram table plus backoff factor
+pred.two <- bigram.df.short %>%  
+    filter(grepl(paste0("^", isr2," "), n.gram)) %>%
+    mutate(predicted.word = getLastWords(n.gram, 1))  %>% 
+    mutate(propability = (counts*0.4*0.4*0.4)/unigram.df.short$counts[unigram.df.short$n.gram == isr2]) %>%
+    arrange(desc(propability)) %>%
+    select(predicted.word, propability) %>%
+    top_n(3) 
+        
+# do exactly the same stuff for the 1-gram table plus backoff factor
+pred.one <- unigram.df.short %>%  
+    arrange(desc(counts)) %>% 
+    mutate(predicted.word = n.gram)  %>% 
+    mutate(propability = (counts*0.4*0.4*0.4*0.4)/sum(unigram.df.short$counts)) %>%
+    arrange(desc(propability)) %>%
+    select(predicted.word, propability) %>%
+    top_n(3) 
+
+# combine results into a datframe and sort
+prop.table <- rbind(pred.five,pred.four,pred.tri,pred.two, pred.one) %>%
+    arrange(desc(propability))  
+
+# drop words wich are found again in a lower N-gram
+prop.table <- prop.table[!duplicated(prop.table$predicted.word),]
+
+# show results
+prop.table <- prop.table %>%
+    top_n(3)
+
+return(prop.table)
+}
+
+# test 
+pred.word4("this thing works pretty")
+```
+
+```{r, warning = FALSE, include = FALSE}
+# this function is for cases where the input is 3 words
+pred.word3 <- function(input.sentence){
+        
+        isr4 <- getLastWords(input.sentence, 3 )
+        isr3 <- getLastWords(isr4, 2)
+        isr2 <- getLastWords(isr3, 1)
+        
+        pred.four <- fourgram.df.short %>%  
+                filter(grepl(paste0("^", isr4 ," "), n.gram)) %>%
+                select(n.gram, counts) %>% 
+                arrange(desc(counts)) %>% 
+                mutate(predicted.word = getLastWords(n.gram, 1))  %>% 
+                mutate(propability = counts/trigram.df.short$counts[trigram.df.short$n.gram == isr4]) %>%
+                arrange(desc(propability)) %>%
+                select(predicted.word, propability) %>%
+                top_n(5) 
+        
+        pred.tri <- trigram.df.short %>%  
+                filter(grepl(paste0("^", isr3," "), n.gram)) %>%
+                select(n.gram, counts) %>% 
+                arrange(desc(counts)) %>% 
+                mutate(predicted.word = getLastWords(n.gram, 1))  %>% 
+                mutate(propability = (counts*0.4)/bigram.df.short$counts[bigram.df.short$n.gram == isr3]) %>%
+                arrange(desc(propability)) %>%
+                select(predicted.word, propability) %>%
+                top_n(5) 
+           
+        pred.two <- bigram.df.short %>%  
+                filter(grepl(paste0("^", isr2," "), n.gram)) %>%
+                select(n.gram, counts) %>% 
+                arrange(desc(counts)) %>% 
+                mutate(predicted.word = getLastWords(n.gram, 1))  %>% 
+                mutate(propability = (counts*0.4*0.4)/unigram.df.short$counts[unigram.df.short$n.gram == isr2]) %>%
+                arrange(desc(propability)) %>%
+                select(predicted.word, propability) %>%
+                top_n(5) 
+           
+        pred.one <- unigram.df.short %>%  
+                arrange(desc(counts)) %>% 
+                mutate(predicted.word = n.gram)  %>% 
+                mutate(propability = (counts*0.4*0.4*0.4)/sum(unigram.df.short$counts)) %>%
+                arrange(desc(propability)) %>%
+                select(predicted.word, propability) %>%
+                top_n(3) 
+        
+prop.table <- rbind(pred.four,pred.tri,pred.two, pred.one) %>%
+                arrange(desc(propability))  
+
+prop.table <- prop.table[!duplicated(prop.table$predicted.word),]
+
+prop.table <- prop.table %>%
+                top_n(3)
+
+return(prop.table)
+}
+
+# test 
+pred.word3("thing works pretty")
+
+# this function is for cases where the input is 2 words
+pred.word2 <- function(input.sentence){
+        
+        isr3 <- getLastWords(input.sentence, 2 )
+        isr2 <- getLastWords(isr3, 1)
+        
+        pred.tri <- trigram.df.short %>%  
+                filter(grepl(paste0("^", isr3," "), n.gram)) %>%
+                select(n.gram, counts) %>% 
+                arrange(desc(counts)) %>% 
+                mutate(predicted.word = getLastWords(n.gram, 1))  %>% 
+                mutate(propability = counts/bigram.df.short$counts[bigram.df.short$n.gram == isr3]) %>%
+                arrange(desc(propability)) %>%
+                select(predicted.word, propability) %>%
+                top_n(5) 
+           
+        pred.two <- bigram.df.short %>%  
+                filter(grepl(paste0("^", isr2," "), n.gram)) %>%
+                select(n.gram, counts) %>% 
+                arrange(desc(counts)) %>% 
+                mutate(predicted.word = getLastWords(n.gram, 1))  %>% 
+                mutate(propability = (counts*0.4)/unigram.df.short$counts[unigram.df.short$n.gram == isr2]) %>%
+                arrange(desc(propability)) %>%
+                select(predicted.word, propability) %>%
+                top_n(5) 
+           
+        pred.one <- unigram.df.short %>%  
+                arrange(desc(counts)) %>% 
+                mutate(predicted.word = n.gram)  %>% 
+                mutate(propability = (counts*0.4*0.4)/sum(unigram.df.short$counts)) %>%
+                arrange(desc(propability)) %>%
+                select(predicted.word, propability) %>%
+                top_n(3) 
+        
+prop.table <- rbind(pred.tri,pred.two, pred.one) %>%
+                arrange(desc(propability))  
+
+prop.table <- prop.table[!duplicated(prop.table$predicted.word),]
+
+prop.table <- prop.table %>%
+                top_n(3)
+
+
+return(prop.table)
+}
+
+# test
+pred.word2("works pretty")
+
+# this function is for cases where the input is 1 word
+pred.word1 <- function(input.sentence){
+        
+        isr2 <- getLastWords(input.sentence, 1)
+        
+        pred.two <- bigram.df.short %>%  
+                filter(grepl(paste0("^", input.sentence," "), n.gram)) %>%
+                select(n.gram, counts) %>% 
+                arrange(desc(counts)) %>% 
+                mutate(predicted.word = getLastWords(n.gram, 1))  %>% 
+                mutate(propability = counts/unigram.df.short$counts[unigram.df.short$n.gram == isr2]) %>%
+                arrange(desc(propability)) %>%
+                select(predicted.word, propability) %>%
+                top_n(5) 
+           
+        pred.one <- unigram.df.short %>%  
+                arrange(desc(counts)) %>% 
+                mutate(predicted.word = n.gram)  %>% 
+                mutate(propability = (counts*0.4)/sum(unigram.df.short$counts)) %>%
+                arrange(desc(propability)) %>%
+                select(predicted.word, propability) %>%
+                top_n(3) 
+        
+prop.table <- rbind(pred.two, pred.one) %>%
+                arrange(desc(propability))  
+
+prop.table <- prop.table[!duplicated(prop.table$predicted.word),]
+
+prop.table <- prop.table %>%
+                top_n(3)
+
+return(prop.table)
+}
+
+pred.word1("pretty")
+
+```
+
+<p align="justify">
+The final prediction function shown below just chooses the appropriate function based on the length of the input string. The reason for this approach is that I eventually want to predict a word whenever the user hits the space-bar.
+</p>
+
+```{r}
+# final function that chooses the appropiate pred.word() depending on input length
+# and normalized the input sentences with norm.text()
+word.pred <- function(input){
+        input.clean <- norm.text(input, profanity)
+        inlength <- length(unlist(strsplit(input.clean," ")))
+        if (inlength >= 4) {
+                p <- pred.word4(input.clean)
+        }  else if (inlength == 3) {
+                p <- pred.word3(input.clean)
+        }  else if (inlength == 2) {
+                p <- pred.word2(input.clean)
+        }  else
+                p <- pred.word1(input.clean)
+return(p)
+}
+```
+
+<p align="justify">
+Now, that I have a working model There are quiet a few things which I need to consider for potentilally alternative specifications (some of them were already outlined):
+</p>
+
+* What is a good alternative to the data frame format to store the N-gram tables? (data.table)
+
+* What sample size offers good predictive performance without over-straining the hardware? (I'll try to find the right balance between speed and accuracy. Getting about 1 million sentences would be nice) 
+
+* Does removing the stop words makes sense? (Removing seems not natural to me)
+
+* Does aggregating words with similar word stem makes sense? (Again, removing seems not natural to me)
+
+* Do I want to consider any other approaches such as Kneser-Ney? (Stupid Backoff seems to be a good compromise between too simple models such as Laplace Smoothing and unnecessary advanced models) 
+
+* To which approach do I switch if the algorithm is rubbish? (Neural Nets)
+
+* How do I choose between word predictions that have the same probability? (no idea, except rolling a dice)
+
+* How do I deal with completely unknown words? (Maybe teach the algorithm to add new words/sentences to the text corpus. Though, I think that might be a bit over the top for this project. Probably just show three most frequent 1-grams)
+
+## Testing the Model on some of the Quiz Data Provided by Coursera 
+
+```{r, message = FALSE, warning = FALSE}
+word.pred("The guy in front of me just bought a pound of bacon, a bouquet, and a case of")
+
+word.pred("You're the reason why I smile everyday. Can you follow me please? It would mean the")
+
+word.pred("Hey sunshine, can you follow me and make me the")
+
+word.pred("Ohhhhh #PointBreak is on tomorrow. Love that film and haven't seen it in quite some")
+```
+
+## Testing Algorithm 1.0 on the Test Data Set 
+
+<p align="justify">
+Before I can answer any of the above statements, obviously I need to measure the accuracy on some test data. So that I'm eventually able to judge the algorithm not only by it's required stored data and it's speed but also by it's accuracy. Below you find some code were the algorithm predicts the last words of each sentence in some of the test data. Note that, word prediction is not comparable to other machine learning fields were accuracy measures are much higher. In my case getting something around 15% would be descent (Someone told me that Swiftkey gets about 30 percent. However, they switched to neuronal nets recently which improved their accuracy a lot).
+</p>
+
+```{r cache = TRUE, message = FALSE, warning = FALSE}
+testing.short <- testing[nchar(testing) > 25]
+set.seed(2017)
+testing.short <- sample(testing.short, 2500, replace = FALSE)
+
+# delete last word to get input sentence and normalize it
+input <- lapply(testing.short, function(x) gsub("\\s*\\w*$", "", x))
+
+# save last true word  
+last.word.real <- lapply(testing.short, function(x) getLastWords(x, 1))
+
+# apply predict function to input only keep words 
+last.word.pred <- lapply(input , function(x) word.pred(x)[,1])
+
+# create data frame that includes pass and fail 
+accuracy.df <- as.data.frame(cbind(last.word.real, last.word.pred)) %>%
+    mutate(last.word.real = as.character(last.word.real)) %>%
+    mutate(last.word.pred = as.character(last.word.pred)) %>%
+    mutate(pass = ifelse(str_detect(last.word.pred,last.word.real), 1, 0))
+
+```
+
+<p align="justify">
+The summary table below shows the accuracy (in percent) for 2500 test sentences, the execution time for a single input string (in seconds), and the size of the required N-gram tables (in byte), as well as the provided number of N-grams. 
+</p>
+
+```{r, message = FALSE, warning = FALSE, include = FALSE}
+accuracy <- sum(accuracy.df$pass == 1, na.rm = TRUE)/nrow(accuracy.df)
+
+size <- object.size(unigram.df.short) + object.size(bigram.df.short) + object.size(trigram.df.short) + object.size(fourgram.df.short) + object.size(fivegram.df.short) 
+
+# varies highly depending on computer
+start.time <- Sys.time()
+word.pred("I hope this thing works pretty")
+end.time <- Sys.time()
+speed <- as.numeric(difftime(end.time, start.time )) 
+speed <- 0.37
+
+g1 <- nrow(unigram.df.short)
+g2 <- nrow(bigram.df.short)
+g3 <- nrow(trigram.df.short)
+g4 <- nrow(fourgram.df.short)
+g5 <- nrow(fivegram.df.short)
+n_grams <- g1+g2+g3+g4+g5
+```
+
+```{r, echo = FALSE, message = FALSE, warning = FALSE}
+summary.df <- as.data.frame(cbind(accuracy, size, speed, n_grams))
+kable(summary.df,digits = 3)
+```
+
+<p align="justify">
+Using about 700.000 N-grams I get a good accuracy. The execution time is becoming a problem though there is no way to increase the N-gram library further using the current approach without becoming too slow. The size of the N-gram tables is alright but still improvable. In order to improve the results I plan to implement the following two changes: Using indexes and shifting to data.table in combination with keys which should result in significant model improvements regarding speed and storage. 
+</p>
+
+## Building the Algorithm: Backoff 2.0 - Indexing, "data.table" and Keys
+
+<p align="justify">
+Indexing means that one uses the 1-gram table as an index dictionary, in a sense that each word gets an unique index number. Any other N-gram table is then transferred into a sequence of numbers. The reason why this may help is that searching for numbers instead of strings is considerably faster. Besides, I can probably save some storage because the data type integer is much smaller then character. So let's give that approach a shot and transform the N-grams accordingly. 
+</p>
+```{r}
+# give each word an unique index number
+unigram.df.short <- unigram.df.short  %>%
+mutate(word.index = c(1:nrow(unigram.df.short)))
+
+# split higher N-grams into single words
+bigram.df.short.sep <- bigram.df.short  %>%
+    separate(n.gram, c("word1", "word2"), " ")
+trigram.df.short.sep <- trigram.df.short  %>%
+    separate(n.gram, c("word1", "word2", "word3"), " ")
+fourgram.df.short.sep <- fourgram.df.short  %>%
+    separate(n.gram, c("word1", "word2", "word3", "word4"), " ")
+fivegram.df.short.sep <- fivegram.df.short  %>%
+    separate(n.gram, c("word1", "word2","word3", "word4", "word5"), " ")
+```
+
+```{r, include=FALSE}
+#remove(bigram.df.short)
+#remove(trigram.df.short)
+#remove(fourgram.df.short)
+#remove(fivegram.df.short)
+```
+
+```{r, echo=TRUE, message=FALSE, warning=FALSE}
+# change N-gram values to corresponding index number
+bigram.df.short.sep   <- as.data.table(sapply(bigram.df.short.sep,   mapvalues, from = unigram.df.short$n.gram, to = unigram.df.short$word.index))
+trigram.df.short.sep  <- as.data.table(sapply(trigram.df.short.sep,  mapvalues, from = unigram.df.short$n.gram, to = unigram.df.short$word.index))
+fourgram.df.short.sep <- as.data.table(sapply(fourgram.df.short.sep, mapvalues, from = unigram.df.short$n.gram, to = unigram.df.short$word.index))
+fivegram.df.short.sep <- as.data.table(sapply(fivegram.df.short.sep, mapvalues, from = unigram.df.short$n.gram, to = unigram.df.short$word.index))
+```
+
+```{r, message=FALSE, warning=FALSE}
+# adjust variable type
+fivegram.df.short.sep[]   <- lapply(fivegram.df.short.sep, as.integer)
+bigram.df.short.sep[]     <- lapply(bigram.df.short.sep, as.integer)
+trigram.df.short.sep[]    <- lapply(trigram.df.short.sep, as.integer)
+fourgram.df.short.sep[]   <- lapply(fourgram.df.short.sep, as.integer)
+```
+
+```{r, message=FALSE, warning=FALSE}
+print(object.size(unigram.df.short) + object.size(bigram.df.short.sep) + object.size(trigram.df.short.sep) + object.size(fourgram.df.short.sep) + object.size(fivegram.df.short.sep))
+```
+
+<p align="justify">
+Nice, the amount of required storage is much lower then before (only about a fourth). Now, the next step is adjust my code and test whether or not the execution time is lower as well. Note that the code of the algorithm remains pretty much the same. The key for improvement here is basically replacing the filter() function of dplyr with the equivalent function of data.table. Besides, I set keys to each N-gram table which is nothing else but keeping a sorted version of certain columns. So why do I expect this changes to improve execution time? In short, instead of vector scans the new algorithm uses binary search now to find adequate N-grams. You may have noticed another change in the code. I do not use discounted probabilities any longer. Instead I use just the frequencies. Higher order N-grams are still more likely to be suggested then lower order N-grams. Honestly speaking, the reason for this was some coding issues related to the key function of "data.table" and results seem to remain the same. I'm far from an expert in "Language Models" and for this specific task, I do not see why using probabilities is required because the order of the suggestion will be the same anyways.
+</p>
+
+```{r, message=FALSE, warning=FALSE}
+# set keys for the N-gram-dictionaries 
+setkey(fivegram.df.short.sep, word1, word2, word3,word4)
+setkey(fourgram.df.short.sep, word1, word2, word3)
+setkey(trigram.df.short.sep, word1, word2)
+setkey(bigram.df.short.sep, word1)
+
+###########################
+###### ALGORITHM 2.0 ######
+###########################
+
+# this function is used if the input sentence is at least for words
+pred4i <- function(input.sentence){
+    
+# take the last four words from input sentence as input for 5-gram table
+last.words4 <- getLastWords(input.sentence, 4)
+
+# transform input sentence into a data.table and replace charatcers with indices
+last.words4   <- strsplit(last.words4 , " ")
+input.table4  <- as.data.table(sapply(last.words4,
+  mapvalues, from = unigram.df.short$n.gram, to = unigram.df.short$word.index))
+w1 <- input.table4[1]
+w2 <- input.table4[2]
+w3 <- input.table4[3]
+w4 <- input.table4[4]
+input.table4 <- NULL
+input.table4 <- cbind(w1,w2,w3,w4)
+colnames(input.table4) <- c("w1","w2","w3","w4")
+input.table4[]   <- lapply(input.table4, as.integer)
+
+pred.five.i <- fivegram.df.short.sep[.(input.table4$w1,
+                                       input.table4$w2,
+                                       input.table4$w3,
+                                       input.table4$w4
+                                       ), nomatch = 0L] %>% 
+mutate(predicted.word = word5) %>%
+arrange(desc(counts)) %>%
+select(predicted.word)
+pred.five.i <- pred.five.i[1:3]
+    
+
+pred.four.i <- fourgram.df.short.sep[.(input.table4$w2,
+                                       input.table4$w3,
+                                       input.table4$w4
+                                       ), nomatch = 0L] %>% 
+mutate(predicted.word = word4) %>%
+arrange(desc(counts)) %>%
+select(predicted.word)
+pred.four.i <- pred.four.i[1:3]
+    
+pred.tri.i <- trigram.df.short.sep[.(input.table4$w3,
+                                     input.table4$w4
+                                     ), nomatch = 0L] %>% 
+mutate(predicted.word = word3) %>%
+arrange(desc(counts)) %>%
+select(predicted.word)
+pred.tri.i <- pred.tri.i[1:3]
+
+pred.bi.i <- bigram.df.short.sep[.( input.table4$w4
+                                    ), nomatch = 0L] %>% 
+mutate(predicted.word = word2) %>%
+arrange(desc(counts)) %>%
+select(predicted.word)
+pred.bi.i <- pred.bi.i[1:3]
+   
+pred.one.i <- as.data.table(data.frame(predicted.word = c("the", "to", "and")))
+
+# combine results into a datframe and sort
+prop.table <- rbind(pred.five.i,pred.four.i,pred.tri.i,pred.bi.i, pred.one.i) 
+
+# drop words wich are found again in a lower N-gram
+prop.table <- prop.table[!duplicated(prop.table$predicted.word),]
+
+# reduce to top three
+prop.table <- na.omit(prop.table)
+prop.table <- prop.table[1:3]
+
+# transform back to words
+w <- mapvalues(prop.table$predicted.word, from = unigram.df.short$word.index, to = unigram.df.short$n.gram)
+        
+prop.table$predicted.word <- w
+
+return(prop.table)
+
+}
+```
+
+```{r, message=FALSE, warning=FALSE, include=FALSE}
+pred3i <- function(input.sentence){
+        
+# take the last four words from input sentence as input for 5-gram table
+last.words4 <- getLastWords(input.sentence, 3)
+
+# transform input sentence into a data.table and replace charatcers with indices
+last.words4   <- strsplit(last.words4 , " ")
+input.table4  <- as.data.table(sapply(last.words4,
+  mapvalues, from = unigram.df.short$n.gram, to = unigram.df.short$word.index))
+w1 <- input.table4[1]
+w2 <- input.table4[2]
+w3 <- input.table4[3]
+input.table4 <- NULL
+input.table4 <- cbind(w1,w2,w3)
+colnames(input.table4) <- c("w1","w2","w3")
+input.table4[]   <- lapply(input.table4, as.integer)
+
+pred.four.i <- fourgram.df.short.sep[.(input.table4$w1,
+                                       input.table4$w2,
+                                       input.table4$w3
+                                       ), nomatch = 0L] %>% 
+mutate(predicted.word = word4) %>%
+arrange(desc(counts)) %>%
+select(predicted.word)
+pred.four.i <- pred.four.i[1:3]
+    
+pred.tri.i <- trigram.df.short.sep[.(input.table4$w2,
+                                     input.table4$w3
+                                     ), nomatch = 0L] %>% 
+mutate(predicted.word = word3) %>%
+arrange(desc(counts)) %>%
+select(predicted.word)
+pred.tri.i <- pred.tri.i[1:3]
+
+pred.bi.i <- bigram.df.short.sep[.( input.table4$w3
+                                    ), nomatch = 0L] %>% 
+mutate(predicted.word = word2) %>%
+arrange(desc(counts)) %>%
+select(predicted.word)
+pred.bi.i <- pred.bi.i[1:3]
+   
+pred.one.i <- as.data.table(data.frame(predicted.word = c("the", "to", "and")))
+
+# combine results into a datframe and sort
+prop.table <- rbind(pred.four.i,pred.tri.i,pred.bi.i, pred.one.i) 
+
+# drop words wich are found again in a lower N-gram
+prop.table <- prop.table[!duplicated(prop.table$predicted.word),]
+
+# reduce to top three
+prop.table <- na.omit(prop.table)
+prop.table <- prop.table[1:3]
+
+# transform back to words
+w <- mapvalues(prop.table$predicted.word, from = unigram.df.short$word.index, to = unigram.df.short$n.gram)
+        
+prop.table$predicted.word <- w
+
+return(prop.table)
+
+}
+
+pred2i <- function(input.sentence){
+        
+# take the last four words from input sentence as input for 5-gram table
+last.words4 <- getLastWords(input.sentence, 2)
+
+# transform input sentence into a data.table and replace charatcers with indices
+last.words4   <- strsplit(last.words4 , " ")
+input.table4  <- as.data.table(sapply(last.words4,
+  mapvalues, from = unigram.df.short$n.gram, to = unigram.df.short$word.index))
+w1 <- input.table4[1]
+w2 <- input.table4[2]
+input.table4 <- NULL
+input.table4 <- cbind(w1,w2)
+colnames(input.table4) <- c("w1","w2")
+input.table4[]   <- lapply(input.table4, as.integer)
+
+
+pred.tri.i <- trigram.df.short.sep[.(input.table4$w1,
+                                     input.table4$w2
+                                     ), nomatch = 0L] %>% 
+mutate(predicted.word = word3) %>%
+arrange(desc(counts)) %>%
+select(predicted.word)
+pred.tri.i <- pred.tri.i[1:3]
+
+pred.bi.i <- bigram.df.short.sep[.( input.table4$w2
+                                    ), nomatch = 0L] %>% 
+mutate(predicted.word = word2) %>%
+arrange(desc(counts)) %>%
+select(predicted.word)
+pred.bi.i <- pred.bi.i[1:3]
+   
+pred.one.i <- as.data.table(data.frame(predicted.word = c("the", "to", "and")))
+
+# combine results into a datframe and sort
+prop.table <- rbind(pred.tri.i,pred.bi.i, pred.one.i) 
+
+# drop words wich are found again in a lower N-gram
+prop.table <- prop.table[!duplicated(prop.table$predicted.word),]
+
+# reduce to top three
+prop.table <- na.omit(prop.table)
+prop.table <- prop.table[1:3]
+
+# transform back to words
+w <- mapvalues(prop.table$predicted.word, from = unigram.df.short$word.index, to = unigram.df.short$n.gram)
+        
+prop.table$predicted.word <- w
+
+return(prop.table)
+
+}
+
+pred1i <- function(input.sentence){
+        
+# take the last four words from input sentence as input for 5-gram table
+last.words4 <- getLastWords(input.sentence, 1)
+
+# transform input sentence into a data.table and replace charatcers with indices
+input.table4  <- as.data.table(sapply(last.words4,
+  mapvalues, from = unigram.df.short$n.gram, to = unigram.df.short$word.index))
+colnames(input.table4) <- "w1"
+input.table4[]   <- lapply(input.table4, as.integer)
+
+pred.bi.i <- bigram.df.short.sep[.( input.table4$w1
+                                    ), nomatch = 0L] %>% 
+mutate(predicted.word = word2) %>%
+arrange(desc(counts)) %>%
+select(predicted.word)
+pred.bi.i <- pred.bi.i[1:3]
+   
+pred.one.i <- as.data.table(data.frame(predicted.word = c("the", "to", "and")))
+
+# combine results into a datframe and sort
+prop.table <- rbind(pred.bi.i, pred.one.i) 
+
+# drop words wich are found again in a lower N-gram
+prop.table <- prop.table[!duplicated(prop.table$predicted.word),]
+
+# reduce to top three
+prop.table <- na.omit(prop.table)
+prop.table <- prop.table[1:3]
+
+# transform back to words
+w <- mapvalues(prop.table$predicted.word, from = unigram.df.short$word.index, to = unigram.df.short$n.gram)
+        
+prop.table$predicted.word <- w
+
+return(prop.table)
+
+}
+
+word.pred2 <- function(input){
+        input.clean <- norm.text(input, profanity)
+        inlength <- length(unlist(strsplit(input," ")))
+        if (inlength >= 4) {
+                p <- pred4i(input.clean)
+        }  else if (inlength == 3) {
+                p <- pred3i(input.clean)
+        }  else if (inlength == 2) {
+                p <- pred2i(input.clean)
+        }  else
+                p <- pred1i(input.clean)
+        p <- as.list(p)
+        p <- as.character(p[[1]])[1:3]
+        
+return(p)
+}
+```
+
+## Testing Algorithm 2.0 on the Test Data Set 
+
+<p align="justify">
+The summary table below compares the new algorithm with the old one. I did increase to sample size significantly which must be considered when evaluating the table. So how does the the new algorithm overall?
+</p>
+
+```{r, message=FALSE, warning=FALSE, include=FALSE}
+# read a prepared sample with 500.000 twitter, news and blog entries
+unigram.df.short      <- read_csv("unigram.csv")
+bigram.df.short.sep   <- read_csv("bigram.csv")
+trigram.df.short.sep  <- read_csv("trigram.csv")
+fourgram.df.short.sep <- read_csv("fourgram.csv")
+fivegram.df.short.sep <- read_csv("fivegram.csv")
+unigram.df.short      <- as.data.table(unigram.df.short)
+bigram.df.short.sep       <- as.data.table(bigram.df.short.sep)
+trigram.df.short.sep      <- as.data.table(trigram.df.short.sep)
+fourgram.df.short.sep     <- as.data.table(fourgram.df.short.sep)
+fivegram.df.short.sep     <- as.data.table(fivegram.df.short.sep)
+```
+
+```{r, message=FALSE, warning=FALSE, include=FALSE}
+setkey(fivegram.df.short.sep, word1, word2, word3,word4)
+setkey(fourgram.df.short.sep, word1, word2, word3)
+setkey(trigram.df.short.sep, word1, word2)
+setkey(bigram.df.short.sep, word1)
+```
+
+```{r, message=FALSE, warning=FALSE, include=FALSE}
+# last.word.pred3 <- lapply(input, function(x) word.pred2(x)) breaks R for some reason
+# do it stepwise instead does not work with markdown
+# last.word.predI  <- lapply(input[1:500], function(x) word.pred2(x))
+# last.word.predII <- lapply(input[501:1000], function(x) word.pred2(x))
+# last.word.predIII <- lapply(input[1001:1500], function(x) word.pred2(x))
+# last.word.predIV <- lapply(input[1501:2000], function(x) word.pred2(x))
+# last.word.predV  <- lapply(input[2001:2500], function(x) word.pred2(x))
+
+# last.word.pred3 <-c(last.word.predI,last.word.predII,last.word.predIII,last.word.predIV,last.word.predV)
+
+# accuracy.df3 <- as.data.frame(cbind(last.word.real,last.word.pred3)) %>%
+#    mutate(last.word.real = as.character(last.word.real)) %>%
+#    mutate(last.word.pred2 = as.character(last.word.pred3)) %>%
+#    mutate(pass = ifelse(str_detect(last.word.pred3,last.word.real), 1, 0))
+
+# accuracy3 <- sum(accuracy.df3$pass == 1, na.rm = TRUE)/nrow(accuracy.df3)
+accuracy3 <- 0.24
+
+size3 <- object.size(unigram.df.short) + object.size(bigram.df.short.sep) + object.size(trigram.df.short.sep) + object.size(fourgram.df.short.sep) + object.size(fivegram.df.short.sep) 
+
+tic()
+word.pred2("I hope this thing works pretty")
+exectime <- toc()
+speed3 <- exectime$toc - exectime$tic
+speed3 <- 0.19
+
+g123 <- nrow(unigram.df.short)
+g223 <- nrow(bigram.df.short.sep)
+g323 <- nrow(trigram.df.short.sep)
+g423 <- nrow(fourgram.df.short.sep)
+g523 <- nrow(fivegram.df.short.sep)
+n_grams3 <- g123+g223+g323+g423+g523
+```
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+summary.df3 <- as.data.frame(cbind(accuracy, accuracy3, size, size3, speed, speed3, n_grams, n_grams3))
+kable(summary.df3, digits = 3)
+```
+
+<p align="justify">
+As I was hoping, accuracy improved because now I use about 2.5 Million N-grams in the dictionary which is almost 4 times as much as before. Moreover, those improvement comes with no costs at all. Using integers, even witch the increased corpus, I still require less storage then originally. Regarding speed the finding is similar (I measured the time required for predicting the next word of the sentence "I hope this thing works pretty" with about 4 of 8 GByte available). Switching to data.table helped a lot. Even with the much longer tables through which the algorithm must search I was able to reduce the execution time by almost half.
+</p>
+
+<p align="justify">
+Altogether, I'm quiet happy with the new model so that the last step that remains now is building the Shiny page. Once the page is running I may try to improve the model further. While I know that there are plenty of ways to improve coding as well as the algorithm (I would still consider this as the Alpha Version), I still hope that anyone who may read this paper may gained some new insights.
+</p>
+
+
+
+
+
